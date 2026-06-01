@@ -24,37 +24,60 @@ class funs:
         test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
         return train_loader, test_loader
 
-    def update_weights(qij, wij, ti, xj, y, alpha, beta, gamma, p):
+    def update_weights(qij, wij, ti, xj, y, alpha, beta, gamma, p, q_decay="mean", dtype=None):
         batch_size = xj.shape[1]
         yiyj= (y @ y.T) / batch_size
         yi_mean = np.mean(y, axis=1, keepdims=True)
         yixj = (y @ xj.T) / batch_size
+        yi_decay = np.mean(y**2, axis=1, keepdims=True) if q_decay=="second_moment" else yi_mean
         delta_w = -alpha * (yiyj - p**2)
         delta_ti = gamma * (yi_mean - p)
         # delta_qij = beta * y * (xj.T - qij)
-        delta_qij = beta * (yixj - yi_mean * qij)
+        delta_qij = beta * (yixj - yi_decay * qij)
         wij = wij + delta_w
         np.fill_diagonal(wij, 0)
         wij = np.minimum(wij, 0)
         ti = ti + delta_ti
         qij = qij + delta_qij
+        if dtype is not None:
+            qij,wij,ti=qij.astype(dtype),wij.astype(dtype),ti.astype(dtype)
         return qij, wij, ti
-    def settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps):
+    def settling_y(qij, wij, ti, xj, yj_star=None, lambda_=10, dt=0.01, settling_steps=300, clip_sigmoid_input=None, dtype=None):
+        if yj_star is None:
+            yj_star=np.zeros((qij.shape[0], xj.shape[1]), dtype=dtype)
         feedforward_i = qij @ xj - ti
         for _ in range(settling_steps):
-            dystar_i= (funs.sigmoid(feedforward_i + wij@yj_star, lambda_) - yj_star) * dt
+            dystar_i= (funs.sigmoid(feedforward_i + wij@yj_star, lambda_, clip_sigmoid_input) - yj_star) * dt
             yj_star += dystar_i
         return yj_star
-    def initialization(number_of_outputs, number_of_inputs):
-        t_init_i=(np.random.rand(number_of_outputs) * 0.01 - 0.005).reshape(number_of_outputs,1) # small random values for initial thresholds
+    def initialization(number_of_outputs, number_of_inputs, threshold_init="random", dtype=None, return_order="twq"):
+        t_init_i=np.zeros((number_of_outputs,1)) if threshold_init=="zero" else (np.random.rand(number_of_outputs) * 0.01 - 0.005).reshape(number_of_outputs,1) # small random values for initial thresholds
         w_init=np.zeros((number_of_outputs, number_of_outputs))
-        q_init = np.random.rand(number_of_outputs, number_of_inputs)
+        q_init=np.random.rand(number_of_outputs, number_of_inputs)
         q_init = q_init /np.linalg.norm(q_init, axis=1, keepdims=True) # every row is output neuron, every column is input to that output neuorn. 
-        return t_init_i,w_init,q_init
+        if dtype is not None:
+            t_init_i,w_init,q_init=t_init_i.astype(dtype),w_init.astype(dtype),q_init.astype(dtype)
+        return (q_init,w_init,t_init_i) if return_order=="qwt" else (t_init_i,w_init,q_init)
 
-    def sigmoid(x,lambda_=10):
-        y=1/(1+np.exp(-lambda_*x))
+    def sigmoid(x,lambda_=10, clip_sigmoid_input=None):
+        z=lambda_*x if clip_sigmoid_input is None else np.clip(lambda_*x, -clip_sigmoid_input, clip_sigmoid_input)
+        y=1/(1+np.exp(-z))
         return y
+    def is_finite(*arrays):
+        return all(np.all(np.isfinite(a)) for a in arrays)
+    def onoff_encode(patches_raw, dtype=None):
+        x_on=np.maximum(patches_raw,0)
+        x_off=np.maximum(-patches_raw,0)
+        x=np.concatenate([x_on,x_off], axis=1)
+        return x.astype(dtype) if dtype is not None else x
+    def component_from_onoff(qij, patch_dim, normalize="maxabs"):
+        q_on=qij[:,:patch_dim]
+        q_off=qij[:,patch_dim:]
+        comp=q_on-q_off
+        comp=comp-np.mean(comp, axis=1, keepdims=True)
+        if normalize=="maxabs":
+            comp=comp/(np.max(np.abs(comp), axis=1, keepdims=True)+1e-12)
+        return comp
     def binarize(ystar, threshold=0.5):
         return (ystar > threshold).astype(float)
     def make_batches_line_pattern(num_batches, size=(8, 8), p_line=1/8, thickness=1,background=0):
@@ -93,8 +116,9 @@ class funs:
         # qij: number_of_outputs x number_of_inputs
         q=qij/(np.linalg.norm(qij, axis=1, keepdims=True)+1e-12)
         sim=q@funs.make_line_masks(size).T # note: making line with perfect line, from top to bottom rows, then left to right columns # shape number_of_outputs x number_of_outputs
+        # -> 16x64 @ 64x16 -> 16x16 for 8x8 input, 128x128 for 16x16 input
         best=np.max(sim, axis=1) # this is the best match to any line for each output neuron, shape number_of_outputs. if 1, perfect line detector, if 0.7, somewhat like a line, if 0.5 or below, not really a line.
-        winners=np.argmax(sim, axis=1)
+        winners=np.argmax(sim, axis=1)# match to which pattern? 
         # note: len(np.unique(winners))/len(winners), this is the coverage, if this value is 1, all neurons match different line types, not the same line. If all neurons detect the same line, coverage is 1/16 = 0.0625 for 8x8
         score=np.mean(best)
         coverage=len(np.unique(winners))/len(winners)
@@ -153,17 +177,19 @@ class funs:
         save_path=os.path.join(save_dir, f"{script_name}_{run_tag}_{name}.png")
         if not os.path.exists(save_path):
             fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    def sample_natural_patches(vm, num_patches, xdim=16, ydim=16):
+    def sample_natural_patches(vm, num_patches, xdim=16, ydim=16, dtype=None):
         edgeBuff=5
         spRange_x=vm.shape[0]-xdim-edgeBuff*2
         spRange_y=vm.shape[1]-ydim-edgeBuff*2
         spRange_t=vm.shape[2]
-        patches=np.zeros((num_patches,xdim*ydim))
+        patches=np.zeros((num_patches,xdim*ydim), dtype=dtype)
         for i in range(num_patches):
             xIdx=np.floor(np.random.rand()*spRange_x+edgeBuff).astype(int)
             yIdx=np.floor(np.random.rand()*spRange_y+edgeBuff).astype(int)
             sIdx=np.floor(np.random.rand()*spRange_t).astype(int)
             patch=vm[xIdx:xIdx+xdim,yIdx:yIdx+ydim,sIdx].reshape(-1)
+            if dtype is not None:
+                patch=patch.astype(dtype)
             patch=patch-np.mean(patch) # zscore
             patch=patch/(np.std(patch)+1e-6)
             patch=np.clip(patch,-3,3)/3

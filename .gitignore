@@ -2,8 +2,3 @@
 __pycache__/
 *.py[cod]
 
-main/data/
-main/Results/
-*.npy
-*.npz
-*.gz

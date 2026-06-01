@@ -33,7 +33,6 @@ results_scale=funs.run_configs(configs_scale, show_note=True)
 results_single=funs.run_configs(configs_single, show_note=True)
 
 #%%
-funs.plot_summary(results_scale, "learning rates scaled together", os.path.join(save_dir, f"{script_name}_summary_scale.png"))
 funs.plot_summary(results_single, "one learning rate changed", os.path.join(save_dir, f"{script_name}_summary_single.png"))
 funs.plot_activity(results_scale, "activity: scaled learning rates", os.path.join(save_dir, f"{script_name}_activity_scale.png"))
 funs.plot_activity(results_single, "activity: single learning rate changes", os.path.join(save_dir, f"{script_name}_activity_single.png"))
@@ -41,29 +40,30 @@ funs.plot_activity(results_single, "activity: single learning rate changes", os.
 #%%
 scales=[]
 scores=[]
+coverages=[]
 activities=[]
 for r in results_scale:
     scales.append(r["alpha"]/0.1)
     scores.append(r["score"])
+    coverages.append(r["coverage"])
     activities.append(np.mean(r["activity"][-200:]))
 
-fig,ax1=plt.subplots(figsize=(7,3.2), facecolor="white")
-ax1.plot(scales, scores, marker="o", linewidth=2, color="#4c78a8", label="line score")
-ax1.set_xscale("log", base=2)
-ax1.set_xticks(scales)
-ax1.set_xticklabels([f"x{s:g}" for s in scales])
-ax1.set_ylim(0,1.05)
-ax1.set_xlabel("learning rate scale")
-ax1.set_ylabel("line score")
-ax2=ax1.twinx()
-ax2.plot(scales, activities, marker="s", linewidth=2, color="#f58518", label="mean activity")
-ax2.set_ylabel("mean activity")
-ax1.legend(frameon=False, loc="upper left")
-ax2.legend(frameon=False, loc="upper right")
+fig,ax=plt.subplots(figsize=(7.2,3.5), dpi=220, facecolor="white")
+ax.plot(scales, scores, marker="o", linewidth=2, color="#4c78a8", label="line score")
+ax.plot(scales, coverages, marker="s", linewidth=2, color="#54a24b", label="coverage")
+ax.plot(scales, activities, marker="^", linewidth=2, color="#f58518", label="mean activity")
+ax.set_xscale("log", base=2)
+ax.set_xticks(scales)
+ax.set_xticklabels([f"x{s:g}" for s in scales])
+ax.set_ylim(0,1.12)
+ax.set_xlabel("learning rate scale")
+ax.set_ylabel("value")
+ax.set_title("learning rates scaled together", pad=18)
+ax.grid(axis="y", color="0.88", lw=.8)
+ax.legend(frameon=False, ncols=3, loc="upper center", bbox_to_anchor=(0.5,1.08))
+ax.spines[["top","right"]].set_visible(False)
 plt.tight_layout()
-save_path=os.path.join(save_dir, f"{script_name}_score_activity_curve.png")
-if not os.path.exists(save_path):
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+fig.savefig(os.path.join(save_dir, f"{script_name}_summary_scale.png"), dpi=300, bbox_inches="tight")
 plt.show()
 
 #%%
