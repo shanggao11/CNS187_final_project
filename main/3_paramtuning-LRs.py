@@ -12,62 +12,59 @@ p_line=1/8
 p=1/8
 num_batches=1500
 settling_steps=300
-configs_scale=[
-    {"name":"x0.25", "size":size, "p_line":p_line, "p":p, "alpha":0.025, "beta":0.005, "gamma":0.005, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"x0.5", "size":size, "p_line":p_line, "p":p, "alpha":0.05, "beta":0.01, "gamma":0.01, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"x1", "size":size, "p_line":p_line, "p":p, "alpha":0.1, "beta":0.02, "gamma":0.02, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"x2", "size":size, "p_line":p_line, "p":p, "alpha":0.2, "beta":0.04, "gamma":0.04, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"x4", "size":size, "p_line":p_line, "p":p, "alpha":0.4, "beta":0.08, "gamma":0.08, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"x8", "size":size, "p_line":p_line, "p":p, "alpha":0.8, "beta":0.16, "gamma":0.16, "num_batches":num_batches, "settling_steps":settling_steps},
-]
+batch_size=1
+base_alpha=0.1
+base_beta=0.02
+base_gamma=0.02
+scales=[0.001,0.01,0.1,0.25,0.5,1,2,4,8,10,100]
 
-configs_single=[
-    {"name":"higher alpha only", "size":size, "p_line":p_line, "p":p, "alpha":0.4, "beta":0.02, "gamma":0.02, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"higher beta only", "size":size, "p_line":p_line, "p":p, "alpha":0.1, "beta":0.08, "gamma":0.02, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"higher gamma only", "size":size, "p_line":p_line, "p":p, "alpha":0.1, "beta":0.02, "gamma":0.08, "num_batches":num_batches, "settling_steps":settling_steps},
-    {"name":"lower beta only", "size":size, "p_line":p_line, "p":p, "alpha":0.1, "beta":0.005, "gamma":0.02, "num_batches":num_batches, "settling_steps":settling_steps},
-]
-
-#%%
-results_scale=funs.run_configs(configs_scale, show_note=True)
-results_single=funs.run_configs(configs_single, show_note=True)
+def make_configs(mode):
+    configs=[]
+    for s in scales:
+        alpha=base_alpha*s if mode in ["all","alpha"] else base_alpha
+        beta=base_beta*s if mode in ["all","beta"] else base_beta
+        gamma=base_gamma*s if mode in ["all","gamma"] else base_gamma
+        configs.append({"name":f"x{s:g}", "size":size, "p_line":p_line, "p":p, "alpha":alpha, "beta":beta, "gamma":gamma, "num_batches":num_batches, "settling_steps":settling_steps, "batch_size":batch_size, "gammatuned":mode=="gamma"})
+    return configs
 
 #%%
-funs.plot_summary(results_single, "one learning rate changed", os.path.join(save_dir, f"{script_name}_summary_single.png"))
-funs.plot_activity(results_scale, "activity: scaled learning rates", os.path.join(save_dir, f"{script_name}_activity_scale.png"))
-funs.plot_activity(results_single, "activity: single learning rate changes", os.path.join(save_dir, f"{script_name}_activity_single.png"))
+groups={
+    "all rates scaled":funs.run_configs(make_configs("all"), show_note=True),
+    "alpha only":funs.run_configs(make_configs("alpha"), show_note=True),
+    "beta only":funs.run_configs(make_configs("beta"), show_note=True),
+    "gamma only":funs.run_configs(make_configs("gamma"), show_note=True),
+}
 
 #%%
-scales=[]
-scores=[]
-coverages=[]
-activities=[]
-for r in results_scale:
-    scales.append(r["alpha"]/0.1)
-    scores.append(r["score"])
-    coverages.append(r["coverage"])
-    activities.append(np.mean(r["activity"][-200:]))
-
-fig,ax=plt.subplots(figsize=(7.2,3.5), dpi=220, facecolor="white")
-ax.plot(scales, scores, marker="o", linewidth=2, color="#4c78a8", label="line score")
-ax.plot(scales, coverages, marker="s", linewidth=2, color="#54a24b", label="coverage")
-ax.plot(scales, activities, marker="^", linewidth=2, color="#f58518", label="mean activity")
-ax.set_xscale("log", base=2)
-ax.set_xticks(scales)
-ax.set_xticklabels([f"x{s:g}" for s in scales])
-ax.set_ylim(0,1.12)
-ax.set_xlabel("learning rate scale")
-ax.set_ylabel("value")
-ax.set_title("learning rates scaled together", pad=18)
-ax.grid(axis="y", color="0.88", lw=.8)
-ax.legend(frameon=False, ncols=3, loc="upper center", bbox_to_anchor=(0.5,1.08))
-ax.spines[["top","right"]].set_visible(False)
-plt.tight_layout()
+fig,axes=plt.subplots(2,2,figsize=(13,6.8),dpi=220,facecolor="white",sharex=True,sharey=True)
+colors={"line score":"#4c78a8", "coverage":"#54a24b", "mean activity":"#f58518"}
+markers={"line score":"o", "coverage":"s", "mean activity":"^"}
+major_ticks=[0.001,0.01,0.1,1,10,100]
+for ax,(title,results) in zip(axes.reshape(-1),groups.items()):
+    scores=[r["score"] for r in results]
+    coverages=[r["coverage"] for r in results]
+    activities=[np.mean(r["activity"][-200:]) for r in results]
+    errors={"line score":[funs.score_sem(r) for r in results], "coverage":None, "mean activity":[funs.activity_sem(r) for r in results]}
+    for label,values in {"line score":scores, "coverage":coverages, "mean activity":activities}.items():
+        ax.errorbar(scales, values, yerr=errors[label], marker=markers[label], lw=1.8, ms=4.5, capsize=2.2, color=colors[label], label=label)
+    ax.set_xscale("log", base=10)
+    ax.set_xticks(major_ticks)
+    ax.set_xticklabels([f"x{s:g}" for s in major_ticks])
+    ax.set_ylim(0,1.08)
+    ax.set_title(title, fontsize=10)
+    ax.grid(axis="y", color="0.9", lw=.8)
+    ax.spines[["top","right"]].set_visible(False)
+for ax in axes[:,0]:
+    ax.set_ylabel("value")
+for ax in axes[-1,:]:
+    ax.set_xlabel("learning rate scale")
+handles,labels=axes[0,0].get_legend_handles_labels()
+fig.legend(handles,labels,frameon=False,ncols=3,loc="upper center",bbox_to_anchor=(0.5,0.96))
+fig.suptitle("learning rate tests", y=0.995, fontsize=13)
+plt.tight_layout(rect=[0,0,1,0.92])
 fig.savefig(os.path.join(save_dir, f"{script_name}_summary_scale.png"), dpi=300, bbox_inches="tight")
-plt.show()
+plt.close(fig)
 
 #%%
-for i,r in enumerate(results_scale):
-    funs.plot_qij(r, save_path=os.path.join(save_dir, f"{script_name}_qij_scale_{i}.png"))
-for i,r in enumerate(results_single):
-    funs.plot_qij(r, save_path=os.path.join(save_dir, f"{script_name}_qij_single_{i}.png"))
+for i,r in enumerate(groups["all rates scaled"]):
+    funs.plot_qij(r, save_path=os.path.join(save_dir, f"{script_name}_qij_scale_{i}.png"), show=False)

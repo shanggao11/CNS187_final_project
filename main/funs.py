@@ -24,6 +24,135 @@ class funs:
         test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
         return train_loader, test_loader
 
+    def resize_flat(x, resolution):
+        import torch.nn.functional as F
+        x=F.interpolate(x, size=(resolution,resolution), mode="bilinear", align_corners=False)
+        return x.reshape(x.shape[0],-1).numpy()
+
+    def train_foldiak(allx, number_of_outputs, p, alpha, beta, gamma, lambda_=10, dt=0.01, settling_steps=120, num_batches=None, pretrain_patterns=100, batch_size=1, checkpoints=None,gammatuned=False):
+        num_batches=int(np.ceil(allx.shape[0]/batch_size)) if num_batches is None else num_batches
+        pretrain_updates=int(np.ceil(pretrain_patterns/batch_size))
+        checkpoints=[] if checkpoints is None else checkpoints
+        number_of_inputs=allx.shape[1]
+        t_init_i,w_init,q_init=funs.initialization(number_of_outputs, number_of_inputs)
+        wij=w_init.copy()
+        ti=t_init_i.copy()
+        qij=q_init.copy()
+        activity=[]
+        qij_checkpoints={}
+        for sstep in range(num_batches):
+            xj=allx[sstep*batch_size:(sstep+1)*batch_size].T
+            yj_star=np.zeros((number_of_outputs,xj.shape[1]))
+            yj_star=funs.settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps)
+            y=funs.binarize(yj_star)
+            if gammatuned:
+                alpha_now,beta_now,gamma_now=(0.0,0.0,gamma) if sstep<pretrain_updates else (alpha,beta,gamma) 
+            else:
+                alpha_now,beta_now,gamma_now=(0.0,0.0,0.1) if sstep<pretrain_updates else (alpha,beta,gamma) # todo, gamma before or after warm up? 
+            qij,wij,ti=funs.update_weights(qij=qij, wij=wij, ti=ti, xj=xj, y=y, alpha=alpha_now, beta=beta_now, gamma=gamma_now, p=p)
+            activity.append(np.mean(y))
+            if sstep in checkpoints:
+                qij_checkpoints[sstep]=qij.copy()
+        if len (checkpoints)>0:
+            return (qij,wij,ti,np.array(activity),qij_checkpoints)
+        else:
+            return (qij,wij,ti,np.array(activity))
+
+
+    def encode_foldiak(allx, qij, wij, ti, lambda_=10, dt=0.01, settling_steps=120):
+        all_y=[]
+        for sstep in range(allx.shape[0]):
+            xj=allx[sstep:sstep+1].T
+            yj_star=np.zeros((qij.shape[0],1))
+            yj_star=funs.settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps)
+            all_y.append(funs.binarize(yj_star)[:,0])
+        return np.array(all_y)
+
+    def activity_rf(allx, all_y):
+        rf=(all_y.T@allx)/(np.sum(all_y, axis=0, keepdims=True).T+1e-12)
+        rf=rf-np.mean(rf, axis=1, keepdims=True) # demean
+        rf=rf/(np.max(np.abs(rf), axis=1, keepdims=True)+1e-12) # scale to -1 or 1
+        return rf
+
+    def perceptron_accuracy(x_train, y_train, x_test, y_test, epochs=25, lr=0.1):
+        import torch
+        from torch import nn
+        import torch.nn.functional as F
+        x_train=torch.tensor(x_train, dtype=torch.float32)
+        x_test=torch.tensor(x_test, dtype=torch.float32)
+        y_train=torch.tensor(y_train, dtype=torch.long)
+        y_test=torch.tensor(y_test, dtype=torch.long)
+        model=nn.Linear(x_train.shape[1],10)
+        opt=torch.optim.Adam(model.parameters(), lr=lr)
+        for epoch in range(epochs):
+            opt.zero_grad()
+            loss=F.cross_entropy(model(x_train), y_train)
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            train_acc=(model(x_train).argmax(1)==y_train).float().mean().item()
+            test_acc=(model(x_test).argmax(1)==y_test).float().mean().item()
+        return train_acc,test_acc
+
+    def mean_abs_offdiag_cosine(a):
+        a=np.asarray(a); 
+        a=a/(np.linalg.norm(a,axis=1,keepdims=True)+1e-12); 
+        c=np.abs(a@a.T)
+        return (np.sum(c)-np.trace(c))/(c.size-len(c))
+    def digit_selectivity(z,y):
+        y=np.asarray(y)
+        responses=np.vstack([np.mean(z[y==d],axis=0) for d in range(10)])
+        return np.mean(np.max(responses,axis=0)/(np.mean(responses,axis=0)+1e-12))
+    def top_energy_fraction(rf, frac=.1, average=True):
+        e=np.sort(np.asarray(rf).reshape(rf.shape[0],-1)**2,axis=1)
+        k=max(1,int(np.ceil(e.shape[1]*frac))) # 10 
+        out=np.sum(e[:,-k:],axis=1)/(np.sum(e,axis=1)+1e-12)
+        return np.mean(out) if average else out
+    def cosine_stats(rf):
+        q=np.asarray(rf).reshape(rf.shape[0],-1); q=q-np.mean(q,axis=1,keepdims=True); q=q/(np.linalg.norm(q,axis=1,keepdims=True)+1e-12)
+        sim=np.abs(q@q.T); mask=~np.eye(sim.shape[0],dtype=bool)
+        return np.mean(sim[mask]),np.percentile(np.max(sim-np.eye(sim.shape[0]),axis=1),90)
+
+    def update_soft_oja(qij, wij, ti, xj, y, alpha, beta, gamma, p):
+        batch_size=xj.shape[1]
+        yiyj=(y@y.T)/batch_size
+        yi_mean=np.mean(y, axis=1, keepdims=True)
+        yixj=(y@xj.T)/batch_size
+        yi2_mean=np.mean(y**2, axis=1, keepdims=True)
+        wij=wij-alpha*(yiyj-p**2)
+        np.fill_diagonal(wij,0)
+        wij=np.minimum(wij,0)
+        ti=ti+gamma*(yi_mean-p)
+        qij=qij+beta*(yixj-yi2_mean*qij)
+        return qij,wij,ti
+    def train_soft_oja_foldiak(allx, number_of_outputs, p, alpha, beta, gamma, lambda_=10, dt=0.01, settling_steps=120, num_batches=None, pretrain_patterns=100):
+        num_batches=allx.shape[0] if num_batches is None else num_batches
+        number_of_inputs=allx.shape[1]
+        t_init_i,w_init,q_init=funs.initialization(number_of_outputs, number_of_inputs)
+        q_init=np.random.randn(number_of_outputs, number_of_inputs)
+        q_init=q_init/(np.linalg.norm(q_init, axis=1, keepdims=True)+1e-12)
+        wij=w_init.copy()
+        ti=t_init_i.copy()
+        qij=q_init.copy()
+        activity=[]
+        for sstep in range(num_batches):
+            xj=allx[sstep:sstep+1].T
+            yj_star=np.zeros((number_of_outputs,1))
+            yj_star=funs.settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps)
+            y=yj_star
+            alpha_now,beta_now,gamma_now=(0.0,0.0,0.1) if sstep<pretrain_patterns else (alpha,beta,gamma)
+            qij,wij,ti=funs.update_soft_oja(qij, wij, ti, xj, y, alpha_now, beta_now, gamma_now, p)
+            activity.append(np.mean(y))
+        return qij,wij,ti,np.array(activity)
+    def encode_soft_foldiak(allx, qij, wij, ti, lambda_=10, dt=0.01, settling_steps=120):
+        all_y=[]
+        for sstep in range(allx.shape[0]):
+            xj=allx[sstep:sstep+1].T
+            yj_star=np.zeros((qij.shape[0],1))
+            yj_star=funs.settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps)
+            all_y.append(yj_star[:,0])
+        return np.array(all_y)
+
     def update_weights(qij, wij, ti, xj, y, alpha, beta, gamma, p, q_decay="mean", dtype=None):
         batch_size = xj.shape[1]
         yiyj= (y @ y.T) / batch_size
@@ -123,6 +252,11 @@ class funs:
         score=np.mean(best)
         coverage=len(np.unique(winners))/len(winners)
         return score,coverage,best,winners
+    def score_sem(result):
+        return np.std(result["best"],ddof=1)/np.sqrt(len(result["best"]))
+    def activity_sem(result, n=200):
+        a=np.asarray(result["activity"][-n:])
+        return np.std(a,ddof=1)/np.sqrt(len(a))
     def learning_rate_note(result):
         recent=result["activity"][-200:]
         if result["score"]>0.8 and result["coverage"]>0.7 and np.std(recent)<0.1:
@@ -136,7 +270,7 @@ class funs:
         if np.std(recent)>0.2:
             return "unstable activity"
         return "weak line detectors"
-    def run_model(size=(8,8), p_line=1/8, p=1/8, alpha=0.1, beta=0.02, gamma=0.02, num_batches=1500, settling_steps=300, seed=0):
+    def run_model(size=(8,8), p_line=1/8, p=1/8, alpha=0.1, beta=0.02, gamma=0.02, num_batches=1500, settling_steps=300, batch_size=1, seed=0, gammatuned=False):
         np.random.seed(seed)
         number_of_inputs=size[0]*size[1]
         number_of_outputs=size[0]+size[1]
@@ -145,29 +279,15 @@ class funs:
         lambda_=10
         thickness=1
         background=0
-        batch_size=1
         pretrain_patterns=100
-        pretrain_updates=pretrain_patterns//batch_size
-        t_init_i,w_init,q_init=funs.initialization(number_of_outputs, number_of_inputs)
         allimg=funs.make_batches_line_pattern(num_batches=num_batches*batch_size, size=size, p_line=p_line, thickness=thickness, background=background)
-        wij=w_init.copy()
-        ti=t_init_i.copy()
-        qij=q_init.copy() #  number_of_outputs x number_of_inputs
-        activity=[]
-        for sstep in range(num_batches):
-            xj=allimg[sstep*batch_size:(sstep+1)*batch_size].reshape(batch_size,-1).T
-            yj_star=np.zeros((number_of_outputs,batch_size))
-            yj_star=funs.settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps)
-            y=funs.binarize(yj_star)
-            alpha_now,beta_now,gamma_now=(0.0,0.0,0.1) if sstep<pretrain_updates else (alpha,beta,gamma)
-            qij,wij,ti=funs.update_weights(qij=qij, wij=wij, ti=ti, xj=xj, y=y, alpha=alpha_now, beta=beta_now, gamma=gamma_now, p=p)
-            activity.append(np.mean(y))
+        qij,wij,ti,activity=funs.train_foldiak(allimg.reshape(allimg.shape[0],-1), number_of_outputs, p, alpha, beta, gamma, lambda_, dt, settling_steps, num_batches, pretrain_patterns, batch_size,gammatuned=gammatuned)
         score,coverage,best,winners=funs.line_score(qij, size)
         return {"qij":qij, "size":size, "p_line":p_line, "p":p, "alpha":alpha, "beta":beta, "gamma":gamma, "activity":np.array(activity), "score":score, "coverage":coverage, "best":best, "winners":winners}
     def run_configs(configs, show_note=False):
         results=[]
         for cfg in configs:
-            result=funs.run_model(size=cfg["size"], p_line=cfg["p_line"], p=cfg["p"], alpha=cfg["alpha"], beta=cfg["beta"], gamma=cfg["gamma"], num_batches=cfg["num_batches"], settling_steps=cfg["settling_steps"], seed=cfg.get("seed",0))
+            result=funs.run_model(size=cfg["size"], p_line=cfg["p_line"], p=cfg["p"], alpha=cfg["alpha"], beta=cfg["beta"], gamma=cfg["gamma"], num_batches=cfg["num_batches"], settling_steps=cfg["settling_steps"], batch_size=cfg.get("batch_size",1), seed=cfg.get("seed",0), gammatuned=cfg.get("gammatuned",False))
             result["name"]=cfg["name"]
             results.append(result)
             note=f", note={funs.learning_rate_note(result)}" if show_note else ""
@@ -191,8 +311,8 @@ class funs:
             if dtype is not None:
                 patch=patch.astype(dtype)
             patch=patch-np.mean(patch) # zscore
-            patch=patch/(np.std(patch)+1e-6)
-            patch=np.clip(patch,-3,3)/3
+            patch=patch/(np.std(patch)+1e-6) 
+            patch=np.clip(patch,-3,3)/3 # large amplitude removal,contrast processing
             patches[i]=patch
         return patches
     def zca_whiten(train_x, test_x, eps=0.1):
@@ -223,13 +343,88 @@ class funs:
         q=q/(np.linalg.norm(q, axis=1, keepdims=True)+1e-12)
         sim=q@q.T
         return funs.offdiag_mean_abs(sim)
+    def calibrate_initial_threshold(vm, qij, ti, p, batch_size, xdim, ydim, calibrate_threshold_batches=40):
+        all_drive = []
+        for _ in range(calibrate_threshold_batches):
+            x_raw = funs.sample_natural_patches(vm, batch_size, xdim, ydim, dtype=np.float32)
+            xj = funs.onoff_encode(x_raw, dtype=np .float32).T # becacuse in foldriak network, we only have + weights, this processsing as -. 
+            all_drive.append(qij @ xj)  
+        all_drive = np.concatenate(all_drive, axis=1)
+        ti[:, 0] = np.quantile(all_drive, 1.0 - p, axis=1).astype(np.float32)
+        return ti
+    def plot_falconbridge_components(qij, patch_dim, xdim, ydim, save_dir, script_name, run_tag, name, nrow=12, ncol=12):
+        # qij 2048 x 512
+        comp = funs.component_from_onoff(qij, patch_dim)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(10, 10), dpi=220, facecolor="white")
+        axes = np.array(axes).reshape(-1)
+        for i, ax in enumerate(axes):
+            if i < comp.shape[0]:
+                ax.imshow(comp[i].reshape(xdim, ydim), cmap="gray", vmin=-1, vmax=1, interpolation="nearest")
+            ax.axis("off")
+        plt.tight_layout(pad=0.15)
+        save_path = os.path.join(save_dir, f"{script_name}_{run_tag}_{name}.png")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return save_path
+    def plot_falconbridge_activity(activity, p, save_dir, script_name, run_tag, name):
+        fig, ax = plt.subplots(figsize=(8, 3), dpi=220, facecolor="white")
+        a = np.array(activity, dtype=np.float32)
+        if len(a) > 50:
+            smooth = np.convolve(a, np.ones(50) / 50, mode="valid")
+            ax.plot(smooth, lw=1.5)
+        else:
+            ax.plot(a, lw=1.5)
+        ax.axhline(p, color="0.35", lw=1, ls="--")
+        ax.set_title("mean output activity")
+        ax.set_xlabel("update batch")
+        ax.set_ylabel("mean y")
+        ax.grid(axis="y", color="0.88", lw=0.8)
+        plt.tight_layout()
+        save_path = os.path.join(save_dir, f"{script_name}_{run_tag}_{name}.png")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return save_path
+    def evaluate_falconbridge_network(vm, qij, wij, ti, patch_dim, xdim, ydim, batch_size, lambda_, dt, settling_steps, clip_sigmoid_input=None, num_test=1000):
+        all_y = []
+        for _ in range(int(np.ceil(num_test / batch_size))):
+            x_raw = funs.sample_natural_patches(vm, batch_size, xdim, ydim, dtype=np.float32)
+            xj = funs.onoff_encode(x_raw, dtype=np.float32).T
+            y = funs.settling_y(qij, wij, ti, xj, lambda_=lambda_, dt=dt, settling_steps=settling_steps, clip_sigmoid_input=clip_sigmoid_input, dtype=np.float32)
+            all_y.append(y.T) # can be (100, 2048)
+        all_y = np.concatenate(all_y, axis=0)[:num_test] # (images, ouputs)
+        comp = funs.component_from_onoff(qij, patch_dim)
+        sparsity = float(np.mean(all_y))
+        corr = funs.output_corr(all_y)
+        similarity = funs.filter_similarity(comp)
+        dead_units = int(np.sum(np.mean(all_y, axis=0) < 1e-4))
+        return sparsity, corr, similarity, dead_units, all_y
+    def load_falconbridge_feature_runs(source_dir, bruno_paths, patch_dim):
+        import glob
+        runs=[]
+        for path in sorted(glob.glob(os.path.join(source_dir,"N*_size16_onoff_*","result_final.npz"))):
+            data=np.load(path)
+            run_dir=os.path.dirname(path)
+            name=os.path.basename(run_dir).split("_onoff_")[0]
+            qij=data["qij"]
+            rf=funs.component_from_onoff(qij,patch_dim)
+            mean_cos,nn90=funs.cosine_stats(rf)
+            runs.append({"name":name,"path":path,"rf":rf,"rf_concentration":funs.top_energy_fraction(rf),"mean_cosine":mean_cos,"nn90_cosine":nn90,"sparsity":float(data["sparsity"]),"output_corr":float(data["corr"]),"dead_units":int(data["dead_units"])})
+        for bruno_path in bruno_paths:
+            if os.path.exists(bruno_path):
+                basis=np.load(bruno_path)
+                rf=basis.T if basis.shape[0]==patch_dim else basis
+                rf=rf-np.mean(rf,axis=1,keepdims=True)
+                rf=rf/(np.max(np.abs(rf),axis=1,keepdims=True)+1e-12)
+                mean_cos,nn90=funs.cosine_stats(rf)
+                runs.append({"name":f"Bruno_N{rf.shape[0]}","path":bruno_path,"rf":rf,"rf_concentration":funs.top_energy_fraction(rf),"mean_cosine":mean_cos,"nn90_cosine":nn90,"sparsity":np.nan,"output_corr":np.nan,"dead_units":np.nan})
+        return runs
     def plot_summary(results, title, save_path=None):
         names=[r["name"] for r in results]
         scores=[r["score"] for r in results]
         coverages=[r["coverage"] for r in results]
         x=np.arange(len(results))
         fig,ax=plt.subplots(figsize=(max(9,1.5*len(results)),3.2), dpi=220, facecolor="white")
-        ax.bar(x-0.18, scores, width=0.36, color="#4f6fd5", edgecolor="white", linewidth=.8, alpha=.88, label="line score")
+        ax.bar(x-0.18, scores, width=0.36, yerr=[funs.score_sem(r) for r in results], capsize=2.4, color="#4f6fd5", edgecolor="white", linewidth=.8, alpha=.88, label="line score")
         ax.bar(x+0.18, coverages, width=0.36, color="0.55", edgecolor="white", linewidth=.8, alpha=.82, label="coverage")
         ax.axhline(0.8, color="#d62728", lw=1.1, ls="--", alpha=.75)
         ax.set_xticks(x)
@@ -264,7 +459,7 @@ class funs:
             if not os.path.exists(save_path):
                 fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.show()
-    def plot_qij(result, title=None, save_path=None):
+    def plot_qij(result, title=None, save_path=None, show=True):
         qij=result["qij"]
         size=result["size"]
         number_of_outputs=qij.shape[0]
@@ -286,4 +481,7 @@ class funs:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             if not os.path.exists(save_path):
                 fig.savefig(save_path, dpi=300, bbox_inches="tight")
-        plt.show()
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)

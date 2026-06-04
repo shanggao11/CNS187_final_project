@@ -16,7 +16,7 @@ number_of_outputs= size[0]+size[1]
 numberoflayers=1
 alpha=0.1
 beta=0.02
-gamma=0.02
+gamma=0.02 #0.02 default
 dt=0.01
 # p=p_line
 p=1/8
@@ -28,38 +28,13 @@ background=0
 batch_size = 1
 pretrain_patterns = 100
 num_images = num_batches * batch_size
-pretrain_updates = pretrain_patterns // batch_size
 # checkpoints = [0, 1, 5, 10, num_batches-1]
 checkpoints = [0, 400, 800, 1200, num_batches-1]
 checkpoints = [c for c in checkpoints if c < num_batches]
 #%
-t_init_i,w_init,q_init = funs.initialization(number_of_outputs, number_of_inputs)
 allimg= funs.make_batches_line_pattern(num_batches=num_images, size=size, p_line=p_line, thickness=thickness, background=background)
-wij = w_init.copy()
-ti=t_init_i.copy()
-qij=q_init.copy()
-qij_checkpoints = {}
-for sstep in range(num_batches):
-    start = sstep * batch_size
-    end = start + batch_size
-    xj = allimg[start:end].reshape(batch_size, -1).T # N x B
-    yj_star = np.zeros((number_of_outputs, batch_size)) # start from neutral activity and let dynamics settle
-    np.fill_diagonal(wij, 0) # no self connection
-    wij = np.minimum(wij, 0)   
-    yj_star = funs.settling_y(qij, wij, ti, xj, yj_star, lambda_, dt, settling_steps)
-    y=funs.binarize(yj_star)
-    if sstep < pretrain_updates: 
-        alpha_now = 0.0
-        beta_now = 0.0
-        gamma_now = 0.1
-    else:
-        alpha_now = alpha
-        beta_now = beta
-        gamma_now = gamma
-    qij, wij, ti = funs.update_weights(qij=qij, wij=wij, ti=ti, xj=xj, y=y, alpha=alpha_now, beta=beta_now, gamma=gamma_now, p=p)
-    if sstep in checkpoints:
-        qij_checkpoints[sstep] = qij.copy()
-    # print(ti)
+
+qij,wij,ti,activity,qij_checkpoints=funs.train_foldiak(allimg.reshape(allimg.shape[0],-1), number_of_outputs, p, alpha, beta, gamma, lambda_, dt, settling_steps, num_batches, pretrain_patterns, batch_size, checkpoints,gammatuned=False)
 
 #%%
 
